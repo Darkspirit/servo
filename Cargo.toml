@@ -38,3 +38,4 @@ surfman = { git = "https://github.com/jdm/rust-offscreen-rendering-context", bra
 [patch."https://github.com/servo/webxr"]
 webxr = { git = "https://github.com/jdm/webxr", branch = "no-gl-readback2" }
 webxr-api = { git = "https://github.com/jdm/webxr", branch = "no-gl-readback2" }
+sparkle = { path = "../sparkle" }
