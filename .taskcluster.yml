@@ -23,6 +23,7 @@ tasks:
         features:
           taskclusterProxy: true
         env:
+          TC_ROOT_URL: ${taskcluster_root_url}
           GIT_URL: ${event.repository.clone_url}
           TASK_FOR: ${tasks_for}
         command:
