@@ -1095,6 +1095,10 @@ impl WebGLRenderingContext {
     pub fn extension_manager(&self) -> &WebGLExtensions {
         &self.extension_manager
     }
+
+    pub fn current_program(&self) -> Option<DomRoot<WebGLProgram>> {
+        self.current_program.get()
+    }
 }
 
 #[cfg(not(feature = "webgl_backtrace"))]
