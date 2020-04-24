@@ -1,6 +1,10 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [master, try]
+  pull_request:
+    branches: [master]
 
 env:
   RUST_BACKTRACE: 1
