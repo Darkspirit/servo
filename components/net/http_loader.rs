@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::connector::{create_http_client, ConnectionCerts, Connector, ExtraCerts, TlsConfig};
+use crate::connector::{create_http_client, CertExceptions, Connector, ReceivedCerts, TlsConfig};
 use crate::cookie;
 use crate::cookie_storage::CookieStorage;
 use crate::decoder::Decoder;
@@ -61,9 +61,9 @@ use std::str::FromStr;
 use std::sync::{Arc as StdArc, Condvar, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 use time::{self, Tm};
-use tokio::prelude::{future, Future, Sink, Stream};
-use tokio::runtime::Runtime;
-use tokio::sync::mpsc::{channel, Receiver as TokioReceiver, Sender as TokioSender};
+use tokio1::prelude::{future, Future, Sink, Stream};
+use tokio1::sync::mpsc::{channel, Receiver as TokioReceiver, Sender as TokioSender};
+use tokio_compat::runtime::Runtime;
 
 lazy_static! {
     pub static ref HANDLE: Mutex<Option<Runtime>> = Mutex::new(Some(Runtime::new().unwrap()));
@@ -91,8 +91,8 @@ pub struct HttpState {
     pub auth_cache: RwLock<AuthCache>,
     pub history_states: RwLock<HashMap<HistoryStateId, Vec<u8>>>,
     pub client: Client<Connector, Body>,
-    pub extra_certs: ExtraCerts,
-    pub connection_certs: ConnectionCerts,
+    pub cert_exceptions: CertExceptions,
+    pub received_certs: ReceivedCerts,
 }
 
 impl HttpState {
@@ -108,8 +108,8 @@ impl HttpState {
                 tls_config,
                 HANDLE.lock().unwrap().as_ref().unwrap().executor(),
             ),
-            extra_certs: ExtraCerts::new(),
-            connection_certs: ConnectionCerts::new(),
+            cert_exceptions: CertExceptions::new(),
+            received_certs: ReceivedCerts::new(),
         }
     }
 }
@@ -658,8 +658,8 @@ fn obtain_response(
 
     let host = request.uri().host().unwrap_or("").to_owned();
     let host_clone = request.uri().host().unwrap_or("").to_owned();
-    let connection_certs = context.state.connection_certs.clone();
-    let connection_certs_clone = context.state.connection_certs.clone();
+    let received_certs = context.state.received_certs.clone();
+    let received_certs_clone = context.state.received_certs.clone();
 
     let headers = headers.clone();
     Box::new(
@@ -667,7 +667,7 @@ fn obtain_response(
             .request(request)
             .and_then(move |res| {
                 // We no longer need to track the cert for this connection.
-                connection_certs.remove(host);
+                received_certs.remove(host);
 
                 let send_end = precise_time_ms();
 
@@ -702,7 +702,7 @@ fn obtain_response(
                 Ok((Decoder::detect(res), msg))
             })
             .map_err(move |e| {
-                NetworkError::from_hyper_error(&e, connection_certs_clone.remove(host_clone))
+                NetworkError::from_hyper_error(&e, received_certs_clone.remove(host_clone))
             }),
     )
 }

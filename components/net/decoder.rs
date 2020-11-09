@@ -31,7 +31,7 @@ use crate::connector::BUF_SIZE;
 use brotli::Decompressor;
 use bytes::{Buf, BufMut, BytesMut};
 use flate2::read::DeflateDecoder;
-use futures::{Async, Future, Poll, Stream};
+use futures01::{Async, Future, Poll, Stream};
 use hyper::header::{HeaderValue, CONTENT_ENCODING, TRANSFER_ENCODING};
 use hyper::{self, Body, Chunk, Response};
 use libflate::non_blocking::gzip;

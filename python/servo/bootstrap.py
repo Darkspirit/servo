@@ -67,8 +67,8 @@ def install_linux_deps(context, pkgs_ubuntu, pkgs_fedora, pkgs_void, force):
 
 
 def install_salt_dependencies(context, force):
-    pkgs_apt = ['build-essential', 'libssl-dev', 'libffi-dev', 'python-dev']
-    pkgs_dnf = ['gcc', 'libffi-devel', 'python-devel', 'openssl-devel']
+    pkgs_apt = ['build-essential', 'libffi-dev', 'python-dev']
+    pkgs_dnf = ['gcc', 'libffi-devel', 'python-devel']
     pkgs_xbps = ['gcc', 'libffi-devel', 'python-devel']
     if not install_linux_deps(context, pkgs_apt, pkgs_dnf, pkgs_xbps, force):
         print("Dependencies are already installed")
@@ -93,8 +93,7 @@ def linux(context, force=False):
     # Please keep these in sync with the packages in README.md
     pkgs_apt = ['git', 'curl', 'autoconf', 'libx11-dev', 'libfreetype6-dev',
                 'libgl1-mesa-dri', 'libglib2.0-dev', 'xorg-dev', 'gperf', 'g++',
-                'build-essential', 'cmake', 'libssl-dev',
-                'liblzma-dev', 'libxmu6', 'libxmu-dev',
+                'build-essential', 'cmake', 'liblzma-dev', 'libxmu6', 'libxmu-dev',
                 "libxcb-render0-dev", "libxcb-shape0-dev", "libxcb-xfixes0-dev",
                 'libgles2-mesa-dev', 'libegl1-mesa-dev', 'libdbus-1-dev',
                 'libharfbuzz-dev', 'ccache', 'clang', 'libunwind-dev',
@@ -105,8 +104,7 @@ def linux(context, force=False):
                 'libunwind-devel', 'mesa-libGL-devel', 'mesa-libEGL-devel',
                 'glib2-devel', 'libX11-devel', 'libXrandr-devel', 'gperf',
                 'fontconfig-devel', 'cabextract', 'ttmkfdir', 'expat-devel',
-                'rpm-build', 'openssl-devel', 'cmake',
-                'libXcursor-devel', 'libXmu-devel',
+                'rpm-build', 'cmake', 'libXcursor-devel', 'libXmu-devel',
                 'dbus-devel', 'ncurses-devel', 'harfbuzz-devel', 'ccache',
                 'clang', 'clang-libs', 'autoconf213', 'python3-devel',
                 'gstreamer1-devel', 'gstreamer1-plugins-base-devel',

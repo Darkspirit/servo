@@ -2,70 +2,257 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+// This module converts between tokio01_hyper <> futures03 <> tokio02_rustls
+// and runs on top of a tokio_compat runtime which supports tokio 0.1 and 0.2.
+// TODO: When upgrading to hyper 0.13, this can be removed in favor of the hyper_rustls crate.
+mod hyper_rustls {
+    // Based on https://github.com/ctz/hyper-rustls/tree/v/0.18.0 for hyper 0.12 (tokio 0.1)
+    // and https://github.com/ctz/hyper-rustls/blob/v/0.21.0/src/connector.rs#L125-L136 for tokio_rustls (tokio 0.2).
+    // All credit goes to this: https://github.com/tokio-rs/tokio-compat/issues/26#issuecomment-591077614
+    mod connector {
+        use futures01::{Future, Poll};
+        // converts between tokio01 and futures03
+        use futures_util::{
+            compat::{Compat, Compat01As03},
+            FutureExt,
+        };
+        use hyper::client::connect::{self, Connect};
+        use rustls::{ClientConfig, Session};
+        use std::sync::Arc;
+        use std::{fmt, io};
+        use tokio_rustls::TlsConnector;
+        // futures03.compat() converts to tokio02
+        use tokio_util::compat::FuturesAsyncReadCompatExt;
+        use webpki::DNSNameRef;
+
+        use super::stream::MaybeHttpsStream;
+
+        /// A Connector for the `https` scheme.
+        #[derive(Clone)]
+        pub struct HttpsConnector<T> {
+            http: T,
+            tls_config: Arc<ClientConfig>,
+        }
+
+        impl<T> fmt::Debug for HttpsConnector<T> {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.debug_struct("HttpsConnector").finish()
+            }
+        }
+
+        impl<T> From<(T, Arc<ClientConfig>)> for HttpsConnector<T> {
+            fn from(args: (T, Arc<ClientConfig>)) -> Self {
+                HttpsConnector {
+                    http: args.0,
+                    tls_config: args.1,
+                }
+            }
+        }
+
+        impl<T> Connect for HttpsConnector<T>
+        where
+            T: Connect<Error = io::Error>,
+            T::Transport: 'static,
+            T::Future: 'static,
+        {
+            type Transport = MaybeHttpsStream<T::Transport>;
+            type Error = io::Error;
+            type Future = HttpsConnecting<T::Transport>;
+
+            fn connect(&self, dst: connect::Destination) -> Self::Future {
+                let is_https = dst.scheme() == "https";
+                let hostname = dst.host().to_string();
+                let connecting = self.http.connect(dst);
+
+                if !is_https {
+                    let fut01 = connecting.map(|(tcp, conn)| (MaybeHttpsStream::Http(tcp), conn));
+                    HttpsConnecting(Box::new(fut01))
+                } else {
+                    let cfg = self.tls_config.clone();
+                    let fut03 = async move {
+                        let connecting_future = Compat01As03::new(connecting);
+                        let (tcp_tokio01, conn) = connecting_future
+                            .await
+                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                        let tcp_futures03 = Compat01As03::new(tcp_tokio01);
+                        let tcp_tokio02 = tcp_futures03.compat();
+
+                        let connector = TlsConnector::from(cfg);
+                        let dnsname = DNSNameRef::try_from_ascii_str(&hostname)
+                            .map_err(|_| io::Error::new(io::ErrorKind::Other, "invalid dnsname"))?;
+
+                        let tls = connector
+                            .connect(dnsname, tcp_tokio02)
+                            .await
+                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+                        let connected = if tls.get_ref().1.get_alpn_protocol() == Some(b"h2") {
+                            conn.negotiated_h2()
+                        } else {
+                            conn
+                        };
+
+                        Ok((MaybeHttpsStream::Https(tls), connected))
+                    }
+                    .boxed();
+
+                    let fut01 = Compat::new(fut03);
+
+                    HttpsConnecting(Box::new(fut01))
+                }
+            }
+        }
+
+        /// A Future representing work to connect to a URL, and a TLS handshake.
+        pub struct HttpsConnecting<T>(
+            Box<
+                dyn Future<Item = (MaybeHttpsStream<T>, connect::Connected), Error = io::Error>
+                    + Send,
+            >,
+        );
+
+        impl<T> Future for HttpsConnecting<T> {
+            type Item = (MaybeHttpsStream<T>, connect::Connected);
+            type Error = io::Error;
+
+            fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+                self.0.poll()
+            }
+        }
+
+        impl<T> fmt::Debug for HttpsConnecting<T> {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.pad("HttpsConnecting")
+            }
+        }
+    }
+    mod stream {
+        // Originally copied from hyperium/hyper-tls#62e3376/src/stream.rs
+        use bytes::{Buf, BufMut};
+        use futures01::Poll;
+        // converts between tokio 0.1 and futures 0.3
+        use futures_util::compat::{Compat, Compat01As03};
+        use std::fmt;
+        use std::io::{self, Read, Write};
+        use tokio1::io::{AsyncRead, AsyncWrite};
+        use tokio_rustls::client::TlsStream;
+        // tokio02.compat() converts to futures03
+        use tokio_util::compat::Tokio02AsyncReadCompatExt;
+
+        /// A stream that might be protected with TLS.
+        pub enum MaybeHttpsStream<T> {
+            /// A stream over plain text.
+            Http(T),
+            /// A stream protected with TLS.
+            Https(TlsStream<tokio_util::compat::Compat<Compat01As03<T>>>),
+        }
+
+        impl<T: fmt::Debug> fmt::Debug for MaybeHttpsStream<T> {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                match *self {
+                    MaybeHttpsStream::Http(..) => f.pad("Http(..)"),
+                    MaybeHttpsStream::Https(..) => f.pad("Https(..)"),
+                }
+            }
+        }
+
+        impl<T: AsyncRead + AsyncWrite> Read for MaybeHttpsStream<T> {
+            #[inline]
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                match *self {
+                    MaybeHttpsStream::Http(ref mut s) => s.read(buf),
+                    MaybeHttpsStream::Https(ref mut tls_tokio02) => {
+                        let tls_futures03 = tls_tokio02.compat();
+                        let mut tls_tokio01 = Compat::new(tls_futures03);
+                        tls_tokio01.read(buf)
+                    },
+                }
+            }
+        }
+
+        impl<T: AsyncRead + AsyncWrite> Write for MaybeHttpsStream<T> {
+            #[inline]
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                match *self {
+                    MaybeHttpsStream::Http(ref mut s) => s.write(buf),
+                    MaybeHttpsStream::Https(ref mut tls_tokio02) => {
+                        let tls_futures03 = tls_tokio02.compat();
+                        let mut tls_tokio01 = Compat::new(tls_futures03);
+                        tls_tokio01.write(buf)
+                    },
+                }
+            }
+
+            #[inline]
+            fn flush(&mut self) -> io::Result<()> {
+                match *self {
+                    MaybeHttpsStream::Http(ref mut s) => s.flush(),
+                    MaybeHttpsStream::Https(ref mut tls_tokio02) => {
+                        let tls_futures03 = tls_tokio02.compat();
+                        let mut tls_tokio01 = Compat::new(tls_futures03);
+                        tls_tokio01.flush()
+                    },
+                }
+            }
+        }
+
+        impl<T: AsyncRead + AsyncWrite> AsyncRead for MaybeHttpsStream<T> {
+            fn read_buf<B: BufMut>(&mut self, buf: &mut B) -> Poll<usize, io::Error> {
+                match *self {
+                    MaybeHttpsStream::Http(ref mut s) => s.read_buf(buf),
+                    MaybeHttpsStream::Https(ref mut tls_tokio02) => {
+                        let tls_futures03 = tls_tokio02.compat();
+                        let mut tls_tokio01 = Compat::new(tls_futures03);
+                        tls_tokio01.read_buf(buf)
+                    },
+                }
+            }
+        }
+
+        impl<T: AsyncRead + AsyncWrite> AsyncWrite for MaybeHttpsStream<T> {
+            fn shutdown(&mut self) -> Poll<(), io::Error> {
+                match *self {
+                    MaybeHttpsStream::Http(ref mut s) => s.shutdown(),
+                    MaybeHttpsStream::Https(ref mut tls_tokio02) => {
+                        let tls_futures03 = tls_tokio02.compat();
+                        let mut tls_tokio01 = Compat::new(tls_futures03);
+                        tls_tokio01.shutdown()
+                    },
+                }
+            }
+
+            fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Poll<usize, io::Error> {
+                match *self {
+                    MaybeHttpsStream::Http(ref mut s) => s.write_buf(buf),
+                    MaybeHttpsStream::Https(ref mut tls_tokio02) => {
+                        let tls_futures03 = tls_tokio02.compat();
+                        let mut tls_tokio01 = Compat::new(tls_futures03);
+                        tls_tokio01.write_buf(buf)
+                    },
+                }
+            }
+        }
+    }
+    pub use connector::HttpsConnector;
+}
+
 use crate::hosts::replace_host;
 use hyper::client::connect::{Connect, Destination};
 use hyper::client::HttpConnector as HyperHttpConnector;
-use hyper::rt::Future;
 use hyper::{Body, Client};
-use hyper_openssl::HttpsConnector;
-use openssl::ex_data::Index;
-use openssl::ssl::{
-    Ssl, SslConnector, SslConnectorBuilder, SslContext, SslMethod, SslOptions, SslVerifyMode,
+use hyper_rustls::HttpsConnector;
+use rustls::{
+    Certificate, ClientConfig, ClientSessionMemoryCache, RootCertStore, ServerCertVerified,
+    ServerCertVerifier, TLSError,
 };
-use openssl::x509::{self, X509StoreContext};
 use std::collections::hash_map::{Entry, HashMap};
 use std::sync::{Arc, Mutex};
-use tokio::prelude::future::Executor;
+use tokio_compat::runtime::TaskExecutor;
 
 pub const BUF_SIZE: usize = 32768;
-pub const ALPN_H2_H1: &'static [u8] = b"\x02h2\x08http/1.1";
-pub const ALPN_H1: &'static [u8] = b"\x08http/1.1";
 
-// See https://wiki.mozilla.org/Security/Server_Side_TLS for orientation.
-const TLS1_2_CIPHERSUITES: &'static str = concat!(
-    "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:",
-    "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:",
-    "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:",
-    "ECDHE-RSA-AES256-SHA:ECDHE-RSA-AES128-SHA@SECLEVEL=2"
-);
-const SIGNATURE_ALGORITHMS: &'static str = concat!(
-    "ed448:ed25519:",
-    "ECDSA+SHA384:ECDSA+SHA256:",
-    "RSA-PSS+SHA512:RSA-PSS+SHA384:RSA-PSS+SHA256:",
-    "RSA+SHA512:RSA+SHA384:RSA+SHA256"
-);
-
-#[derive(Clone)]
-pub struct ConnectionCerts {
-    certs: Arc<Mutex<HashMap<String, (Vec<u8>, u32)>>>,
-}
-
-impl ConnectionCerts {
-    pub fn new() -> Self {
-        Self {
-            certs: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    fn store(&self, host: String, cert_bytes: Vec<u8>) {
-        let mut certs = self.certs.lock().unwrap();
-        let entry = certs.entry(host).or_insert((cert_bytes, 0));
-        entry.1 += 1;
-    }
-
-    pub(crate) fn remove(&self, host: String) -> Option<Vec<u8>> {
-        match self.certs.lock().unwrap().entry(host) {
-            Entry::Vacant(_) => return None,
-            Entry::Occupied(mut e) => {
-                e.get_mut().1 -= 1;
-                if e.get().1 == 0 {
-                    return Some((e.remove_entry().1).0);
-                }
-                Some(e.get().0.clone())
-            },
-        }
-    }
-}
+pub type Connector = HttpsConnector<HttpConnector>;
+pub type TlsConfig = Arc<ClientConfig>;
 
 pub struct HttpConnector {
     inner: HyperHttpConnector,
@@ -90,134 +277,233 @@ impl Connect for HttpConnector {
         let mut new_dest = dest.clone();
         let addr = replace_host(dest.host());
         new_dest.set_host(&*addr).unwrap();
+
         self.inner.connect(new_dest)
     }
 }
 
-pub type Connector = HttpsConnector<HttpConnector>;
-pub type TlsConfig = SslConnectorBuilder;
+#[derive(Clone)]
+pub struct ReceivedCerts {
+    certs: Arc<Mutex<HashMap<String, (Certificate, u32)>>>,
+}
+
+impl ReceivedCerts {
+    pub fn new() -> Self {
+        Self {
+            certs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn store(&self, host: String, certificate: Certificate) {
+        debug!(
+            "storing received cert from {}:\n{}",
+            host,
+            certificate.as_pem()
+        );
+        let mut certs = self.certs.lock().unwrap();
+        let entry = certs.entry(host).or_insert((certificate, 0));
+        entry.1 += 1;
+    }
+
+    pub(crate) fn remove(&self, host: String) -> Option<String> {
+        match self.certs.lock().unwrap().entry(host) {
+            Entry::Vacant(_) => None,
+            Entry::Occupied(mut e) => {
+                e.get_mut().1 -= 1;
+                let certificate = if e.get().1 == 0 {
+                    (e.remove_entry().1).0
+                } else {
+                    e.get().0.clone()
+                };
+                Some(certificate.as_pem())
+            },
+        }
+    }
+}
+
+trait CertAsPemExt {
+    fn as_pem(&self) -> String;
+}
+impl CertAsPemExt for Certificate {
+    fn as_pem(&self) -> String {
+        format!(
+            "-----BEGIN CERTIFICATE-----{}\n-----END CERTIFICATE-----",
+            base64::encode(&self.0)
+                .chars()
+                .enumerate()
+                .flat_map(|(i, c)| {
+                    if i % 64 == 0 { Some('\n') } else { None }
+                        .into_iter()
+                        .chain(std::iter::once(c))
+                })
+                .collect::<String>()
+        )
+    }
+}
 
 #[derive(Clone)]
-pub struct ExtraCerts(Arc<Mutex<Vec<Vec<u8>>>>);
+pub struct CertExceptions(Arc<Mutex<Vec<Certificate>>>);
 
-impl ExtraCerts {
+impl CertExceptions {
     pub fn new() -> Self {
         Self(Arc::new(Mutex::new(vec![])))
     }
 
-    pub fn add(&self, bytes: Vec<u8>) {
-        self.0.lock().unwrap().push(bytes);
+    pub fn add(&self, pem: String) {
+        let mut certs = rustls::internal::pemfile::certs(&mut pem.as_bytes()).unwrap();
+        self.0.lock().unwrap().push(certs.remove(0));
     }
 }
 
-struct Host(String);
+// from https://github.com/ctz/rustls/blob/v/0.18.1/rustls/src/verify.rs#L16-L33
+type SignatureAlgorithms = &'static [&'static webpki::SignatureAlgorithm];
+static SUPPORTED_SIG_ALGS: SignatureAlgorithms = &[
+    &webpki::ECDSA_P256_SHA256,
+    &webpki::ECDSA_P256_SHA384,
+    &webpki::ECDSA_P384_SHA256,
+    &webpki::ECDSA_P384_SHA384,
+    &webpki::ED25519,
+    &webpki::RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
+    &webpki::RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
+    &webpki::RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
+    &webpki::RSA_PKCS1_2048_8192_SHA256,
+    &webpki::RSA_PKCS1_2048_8192_SHA384,
+    &webpki::RSA_PKCS1_2048_8192_SHA512,
+    &webpki::RSA_PKCS1_3072_8192_SHA384,
+];
 
-lazy_static! {
-    static ref EXTRA_INDEX: Index<SslContext, ExtraCerts> = SslContext::new_ex_index().unwrap();
-    static ref CONNECTION_INDEX: Index<SslContext, ConnectionCerts> =
-        SslContext::new_ex_index().unwrap();
-    static ref HOST_INDEX: Index<Ssl, Host> = Ssl::new_ex_index().unwrap();
+// from https://github.com/ctz/rustls/blob/v/0.18.1/rustls/src/verify.rs#L292-L322
+type CertChainAndRoots<'a, 'b> = (
+    webpki::EndEntityCert<'a>,
+    Vec<&'a [u8]>,
+    Vec<webpki::TrustAnchor<'b>>,
+);
+
+fn prepare<'a, 'b>(
+    roots: &'b RootCertStore,
+    presented_certs: &'a [Certificate],
+) -> Result<CertChainAndRoots<'a, 'b>, TLSError> {
+    if presented_certs.is_empty() {
+        return Err(TLSError::NoCertificatesPresented);
+    }
+
+    // EE cert must appear first.
+    let cert = webpki::EndEntityCert::from(&presented_certs[0].0).map_err(TLSError::WebPKIError)?;
+
+    let chain: Vec<&'a [u8]> = presented_certs
+        .iter()
+        .skip(1)
+        .map(|cert| cert.0.as_ref())
+        .collect();
+
+    let trustroots: Vec<webpki::TrustAnchor> = roots
+        .roots
+        .iter()
+        // slightly modified because module is private
+        .map(|owned_trust_anchor| owned_trust_anchor.to_trust_anchor())
+        .collect();
+
+    Ok((cert, chain, trustroots))
+}
+
+fn try_now() -> Result<webpki::Time, TLSError> {
+    webpki::Time::try_from(std::time::SystemTime::now())
+        .map_err(|_| TLSError::FailedToGetCurrentTime)
+}
+
+// from https://github.com/ctz/rustls/blob/v/0.18.1/rustls/src/verify.rs#L230-L270
+pub struct ServoWebPKIVerifier {
+    pub cert_exceptions: CertExceptions,
+    pub received_certs: ReceivedCerts,
+    /// time provider
+    pub time: fn() -> Result<webpki::Time, TLSError>,
+}
+impl ServoWebPKIVerifier {
+    pub fn new(
+        cert_exceptions: CertExceptions,
+        received_certs: ReceivedCerts,
+    ) -> ServoWebPKIVerifier {
+        ServoWebPKIVerifier {
+            cert_exceptions,
+            received_certs,
+            time: try_now,
+        }
+    }
+}
+impl ServerCertVerifier for ServoWebPKIVerifier {
+    fn verify_server_cert(
+        &self,
+        roots: &RootCertStore,
+        presented_certs: &[Certificate],
+        dns_name: webpki::DNSNameRef,
+        ocsp_response: &[u8],
+    ) -> Result<ServerCertVerified, TLSError> {
+        if !presented_certs.is_empty() {
+            // certificate exceptions
+            // TODO: WIP: dns_name must be compared
+            let presented_cert = &presented_certs[0];
+            let cert_exceptions = &*self.cert_exceptions.0.lock().unwrap();
+            for cert in cert_exceptions {
+                if *cert == *presented_cert {
+                    return Ok(ServerCertVerified::assertion());
+                }
+            }
+            let hostname: &str = dns_name.into();
+            self.received_certs
+                .store(hostname.to_string(), presented_cert.clone());
+        }
+
+        let (cert, chain, trustroots) = prepare(roots, presented_certs)?;
+        let now = (self.time)()?;
+        let cert = cert
+            .verify_is_valid_tls_server_cert(
+                SUPPORTED_SIG_ALGS,
+                &webpki::TLSServerTrustAnchors(&trustroots),
+                &chain,
+                now,
+            )
+            .map_err(TLSError::WebPKIError)
+            .map(|_| cert)?;
+
+        if !ocsp_response.is_empty() {
+            trace!("Unvalidated OCSP response: {:?}", ocsp_response.to_vec());
+        }
+
+        cert.verify_is_valid_for_dns_name(dns_name)
+            .map_err(TLSError::WebPKIError)
+            .map(|_| ServerCertVerified::assertion())
+    }
 }
 
 pub fn create_tls_config(
-    certs: &str,
-    alpn: &[u8],
-    extra_certs: ExtraCerts,
-    connection_certs: ConnectionCerts,
+    additional_ca_certs: &str,
+    alpn: Vec<Vec<u8>>,
+    cert_exceptions: CertExceptions,
+    received_certs: ReceivedCerts,
 ) -> TlsConfig {
-    // certs include multiple certificates. We could add all of them at once,
-    // but if any of them were already added, openssl would fail to insert all
-    // of them.
-    let mut certs = certs;
-    let mut cfg = SslConnector::builder(SslMethod::tls()).unwrap();
-    loop {
-        let token = "-----END CERTIFICATE-----";
-        if let Some(index) = certs.find(token) {
-            let (cert, rest) = certs.split_at(index + token.len());
-            certs = rest;
-            let cert = x509::X509::from_pem(cert.as_bytes()).unwrap();
-            cfg.cert_store_mut()
-                .add_cert(cert)
-                .or_else(|e| {
-                    let v: Option<Option<&str>> = e.errors().iter().nth(0).map(|e| e.reason());
-                    if v == Some(Some("cert already in hash table")) {
-                        warn!("Cert already in hash table. Ignoring.");
-                        // Ignore error X509_R_CERT_ALREADY_IN_HASH_TABLE which means the
-                        // certificate is already in the store.
-                        Ok(())
-                    } else {
-                        Err(e)
-                    }
-                })
-                .expect("could not set CA file");
-        } else {
-            break;
-        }
-    }
-    cfg.set_alpn_protos(alpn)
-        .expect("could not set alpn protocols");
-    cfg.set_cipher_list(TLS1_2_CIPHERSUITES)
-        .expect("could not set TLS 1.2 ciphersuites");
-    cfg.set_sigalgs_list(SIGNATURE_ALGORITHMS)
-        .expect("could not set signature algorithms");
-    cfg.set_options(
-        SslOptions::NO_SSLV2 |
-            SslOptions::NO_SSLV3 |
-            SslOptions::NO_TLSV1 |
-            SslOptions::NO_TLSV1_1 |
-            SslOptions::NO_COMPRESSION,
-    );
+    let mut cfg = ClientConfig::new();
+    cfg.alpn_protocols = alpn;
+    cfg.ct_logs = Some(&ct_logs::LOGS);
+    cfg.dangerous()
+        .set_certificate_verifier(Arc::new(ServoWebPKIVerifier::new(
+            cert_exceptions,
+            received_certs,
+        )));
+    cfg.set_persistence(ClientSessionMemoryCache::new(128));
+    cfg.root_store
+        .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+    let _ = cfg
+        .root_store
+        .add_pem_file(&mut additional_ca_certs.as_bytes());
 
-    cfg.set_ex_data(*EXTRA_INDEX, extra_certs);
-    cfg.set_ex_data(*CONNECTION_INDEX, connection_certs);
-    cfg.set_verify_callback(SslVerifyMode::PEER, |verified, x509_store_context| {
-        if verified {
-            return true;
-        }
-
-        let ssl_idx = X509StoreContext::ssl_idx().unwrap();
-        let ssl = x509_store_context.ex_data(ssl_idx).unwrap();
-
-        // Obtain the cert bytes for this connection.
-        let cert = match x509_store_context.current_cert() {
-            Some(cert) => cert,
-            None => return false,
-        };
-        let pem = match cert.to_pem() {
-            Ok(pem) => pem,
-            Err(_) => return false,
-        };
-
-        let ssl_context = ssl.ssl_context();
-
-        // Ensure there's an entry stored in the set of known connection certs for this connection.
-        if let Some(host) = ssl.ex_data(*HOST_INDEX) {
-            let connection_certs = ssl_context.ex_data(*CONNECTION_INDEX).unwrap();
-            connection_certs.store((*host).0.clone(), pem.clone());
-        }
-
-        // Fall back to the dynamic set of allowed certs.
-        let extra_certs = ssl_context.ex_data(*EXTRA_INDEX).unwrap();
-        for cert in &*extra_certs.0.lock().unwrap() {
-            if pem == *cert {
-                return true;
-            }
-        }
-        false
-    });
-
-    cfg
+    Arc::new(cfg)
 }
 
-pub fn create_http_client<E>(tls_config: TlsConfig, executor: E) -> Client<Connector, Body>
-where
-    E: Executor<Box<dyn Future<Error = (), Item = ()> + Send + 'static>> + Sync + Send + 'static,
-{
-    let mut connector = HttpsConnector::with_connector(HttpConnector::new(), tls_config).unwrap();
-    connector.set_callback(|configuration, destination| {
-        configuration.set_ex_data(*HOST_INDEX, Host(destination.host().to_owned()));
-        Ok(())
-    });
+pub fn create_http_client(
+    tls_config: TlsConfig,
+    executor: TaskExecutor,
+) -> Client<Connector, Body> {
+    let connector = HttpsConnector::from((HttpConnector::new(), tls_config));
 
     Client::builder()
         .http1_title_case_headers(true)

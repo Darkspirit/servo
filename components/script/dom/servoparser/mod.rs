@@ -723,15 +723,15 @@ impl FetchResponseListener for ParserContext {
     fn process_request_eof(&mut self) {}
 
     fn process_response(&mut self, meta_result: Result<FetchMetadata, NetworkError>) {
-        let mut ssl_error = None;
+        let mut tls_error = None;
         let mut network_error = None;
         let metadata = match meta_result {
             Ok(meta) => Some(match meta {
                 FetchMetadata::Unfiltered(m) => m,
                 FetchMetadata::Filtered { unsafe_, .. } => unsafe_,
             }),
-            Err(NetworkError::SslValidation(reason, cert_bytes)) => {
-                ssl_error = Some((reason, cert_bytes));
+            Err(NetworkError::TlsValidation(reason, pem)) => {
+                tls_error = Some((reason, pem));
                 let mut meta = Metadata::default(self.url.clone());
                 let mime: Option<Mime> = "text/html".parse().ok();
                 meta.set_content_type(mime.as_ref());
@@ -814,12 +814,11 @@ impl FetchResponseListener for ParserContext {
             },
             Some(ref mime) if mime.type_() == mime::TEXT && mime.subtype() == mime::HTML => {
                 // Handle text/html
-                if let Some((reason, bytes)) = ssl_error {
+                if let Some((reason, pem)) = tls_error {
                     self.is_synthesized_document = true;
                     let page = resources::read_string(Resource::BadCertHTML);
                     let page = page.replace("${reason}", &reason);
-                    let page =
-                        page.replace("${bytes}", std::str::from_utf8(&bytes).unwrap_or_default());
+                    let page = page.replace("${pem}", &pem);
                     let page =
                         page.replace("${secret}", &net_traits::PRIVILEGED_SECRET.to_string());
                     parser.push_string_input_chunk(page);

@@ -15,8 +15,6 @@ Building Servo is quite easy. Install the prerequisites described in the [README
 ./mach build -d
 ```
 
-*Note: on Mac, you might run into an SSL issue while compiling. You'll find a solution to this problem [here](https://github.com/sfackler/rust-openssl/issues/255).*
-
 The `-d` option means "debug build". You can also build with the `-r` option which means "release build". Building with `-d` will allow you to use a debugger (lldb). A `-r` build is more performant. Release builds are slower to build.
 
 You can use and build a release build and a debug build in parallel.

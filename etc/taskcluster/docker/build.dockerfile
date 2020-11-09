@@ -28,9 +28,6 @@ RUN \
         # GStreamer
         libpcre3-dev \
         #
-        # OpenSSL
-        libssl-dev \
-        #
         # blurz
         libdbus-1-dev \
         #

@@ -13,7 +13,7 @@ use devtools_traits::HttpResponse as DevtoolsHttpResponse;
 use devtools_traits::{ChromeToDevtoolsControlMsg, DevtoolsControlMsg, NetworkEvent};
 use flate2::write::{DeflateEncoder, GzEncoder};
 use flate2::Compression;
-use futures::{self, Future, Stream};
+use futures01::{self, Future, Stream};
 use headers::authorization::Basic;
 use headers::{
     Authorization, ContentLength, Date, HeaderMapExt, Host, StrictTransportSecurity, UserAgent,
@@ -52,7 +52,7 @@ fn mock_origin() -> ImmutableOrigin {
 fn read_response(req: HyperRequest<Body>) -> impl Future<Item = String, Error = ()> {
     req.into_body()
         .concat2()
-        .and_then(|body| futures::future::ok(str::from_utf8(&body).unwrap().to_owned()))
+        .and_then(|body| futures01::future::ok(str::from_utf8(&body).unwrap().to_owned()))
         .map_err(|_| ())
 }
 
@@ -523,7 +523,7 @@ fn test_load_doesnt_send_request_body_on_any_redirect() {
         read_response(request)
             .and_then(|data| {
                 assert_eq!(data, "");
-                futures::future::ok(())
+                futures01::future::ok(())
             })
             .poll()
             .unwrap();
@@ -536,7 +536,7 @@ fn test_load_doesnt_send_request_body_on_any_redirect() {
         read_response(request)
             .and_then(|data| {
                 assert_eq!(data, "Body on POST");
-                futures::future::ok(())
+                futures01::future::ok(())
             })
             .poll()
             .unwrap();

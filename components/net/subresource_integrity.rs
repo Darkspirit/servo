@@ -4,7 +4,7 @@
 
 use base64;
 use net_traits::response::{Response, ResponseBody, ResponseType};
-use openssl::hash::{hash, MessageDigest};
+use ring::digest::{digest, Algorithm, SHA256, SHA384, SHA512};
 use std::iter::Filter;
 use std::str::Split;
 use std::sync::MutexGuard;
@@ -117,11 +117,11 @@ pub fn get_strongest_metadata(integrity_metadata_list: Vec<SriEntry>) -> Vec<Sri
 /// <https://w3c.github.io/webappsec-subresource-integrity/#apply-algorithm-to-response>
 fn apply_algorithm_to_response(
     body: MutexGuard<ResponseBody>,
-    message_digest: MessageDigest,
+    algorithm: &'static Algorithm,
 ) -> String {
     if let ResponseBody::Done(ref vec) = *body {
-        let response_digest = hash(message_digest, vec).unwrap(); //Now hash
-        base64::encode(&response_digest)
+        let result = digest(algorithm, vec);
+        base64::encode(result.as_ref())
     } else {
         unreachable!("Tried to calculate digest of incomplete response body")
     }
@@ -153,17 +153,17 @@ pub fn is_response_integrity_valid(integrity_metadata: &str, response: &Response
     let metadata: Vec<SriEntry> = get_strongest_metadata(parsed_metadata_list);
     for item in metadata {
         let body = response.body.lock().unwrap();
-        let algorithm = item.alg;
-        let digest = item.val;
+        let alg = item.alg;
+        let expected_value = item.val;
 
-        let message_digest = match &*algorithm {
-            "sha256" => MessageDigest::sha256(),
-            "sha384" => MessageDigest::sha384(),
-            "sha512" => MessageDigest::sha512(),
+        let algorithm = match &*alg {
+            "sha256" => &SHA256,
+            "sha384" => &SHA384,
+            "sha512" => &SHA512,
             _ => continue,
         };
 
-        if apply_algorithm_to_response(body, message_digest) == digest {
+        if apply_algorithm_to_response(body, algorithm) == expected_value {
             return true;
         }
     }

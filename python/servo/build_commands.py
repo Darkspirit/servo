@@ -31,7 +31,7 @@ from mach.decorators import (
 from mach.registrar import Registrar
 
 from mach_bootstrap import _get_exec_path
-from servo.command_base import CommandBase, cd, call, check_call, append_to_path_env, gstreamer_root
+from servo.command_base import CommandBase, call, check_call, append_to_path_env, gstreamer_root
 from servo.gstreamer import windows_dlls, windows_plugins, macos_dylibs, macos_plugins
 from servo.util import host_triple
 
@@ -350,17 +350,6 @@ class MachCommands(CommandBase):
             android_lib = self.config["android"]["lib"]
             android_arch = self.config["android"]["arch"]
 
-            # Build OpenSSL for android
-            env["OPENSSL_VERSION"] = "1.1.1d"
-            make_cmd = ["make"]
-            if jobs is not None:
-                make_cmd += ["-j" + jobs]
-            openssl_dir = path.join(target_path, target, "native", "openssl")
-            if not path.exists(openssl_dir):
-                os.makedirs(openssl_dir)
-            shutil.copy(path.join(self.android_support_dir(), "openssl.makefile"), openssl_dir)
-            shutil.copy(path.join(self.android_support_dir(), "openssl.sh"), openssl_dir)
-
             # Check if the NDK version is 15
             if not os.path.isfile(path.join(env["ANDROID_NDK"], 'source.properties')):
                 print("ANDROID_NDK should have file `source.properties`.")
@@ -373,17 +362,6 @@ class MachCommands(CommandBase):
                     sys.exit(1)
 
             env["RUST_TARGET"] = target
-            with cd(openssl_dir):
-                status = call(
-                    make_cmd + ["-f", "openssl.makefile"],
-                    env=env,
-                    verbose=verbose)
-                if status:
-                    return status
-            openssl_dir = path.join(openssl_dir, "openssl-{}".format(env["OPENSSL_VERSION"]))
-            env['OPENSSL_LIB_DIR'] = openssl_dir
-            env['OPENSSL_INCLUDE_DIR'] = path.join(openssl_dir, "include")
-            env['OPENSSL_STATIC'] = 'TRUE'
             # Android builds also require having the gcc bits on the PATH and various INCLUDE
             # path munging if you do not want to install a standalone NDK. See:
             # https://dxr.mozilla.org/mozilla-central/source/build/autoconf/android.m4#139-161
@@ -598,11 +576,6 @@ class MachCommands(CommandBase):
             env.setdefault("CMAKE_TOOLCHAIN_FILE", path.join(ml_support, "toolchain.cmake"))
             env.setdefault("_LIBCPP_INLINE_VISIBILITY", "__attribute__((__always_inline__))")
 
-            # The Open SSL configuration
-            env.setdefault("OPENSSL_DIR", path.join(target_path, target, "native", "openssl"))
-            env.setdefault("OPENSSL_VERSION", "1.1.1d")
-            env.setdefault("OPENSSL_STATIC", "1")
-
             # GStreamer configuration
             env.setdefault("GSTREAMER_DIR", path.join(target_path, target, "native", "gstreamer-1.16.0"))
             env.setdefault("GSTREAMER_URL", "https://servo-deps.s3.amazonaws.com/gstreamer/gstreamer-magicleap-1.16.0-20190823-104505.tgz")
@@ -613,11 +586,6 @@ class MachCommands(CommandBase):
 
             # Only build libmlservo
             opts += ["--package", "libmlservo"]
-
-            # Download and build OpenSSL if necessary
-            status = call(path.join(ml_support, "openssl.sh"), env=env, verbose=verbose)
-            if status:
-                return status
 
             # Download prebuilt Gstreamer if necessary
             if not os.path.exists(path.join(env["GSTREAMER_DIR"], "system")):
@@ -695,11 +663,6 @@ class MachCommands(CommandBase):
                 if not dev and not libsimpleservo:
                     call(["editbin", "/nologo", "/subsystem:windows", path.join(servo_exe_dir, "servo.exe")],
                          verbose=verbose)
-                # on msvc, we need to copy in some DLLs in to the servo.exe dir and the directory for unit tests.
-                for ssl_lib in ["libssl.dll", "libcrypto.dll"]:
-                    ssl_path = path.join(env['OPENSSL_LIB_DIR'], "../bin", ssl_lib)
-                    shutil.copy(ssl_path, servo_exe_dir)
-                    shutil.copy(ssl_path, path.join(servo_exe_dir, "deps"))
 
                 build_path = path.join(servo_exe_dir, "build")
                 assert os.path.exists(build_path)

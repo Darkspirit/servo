@@ -6,19 +6,19 @@
   <p>${reason}</p>
   <button id="leave" onclick="history.back()">Go back (recommended)</button>
   <button id="allow">Allow certificate temporarily</button>
-  <pre id="bytes">${bytes}</pre>
+  <pre id="pem">${pem}</pre>
   <script>
-    let bytes = document.getElementById('bytes').textContent;
+    let pem = document.getElementById('pem').textContent;
     let button = document.getElementById('allow');
     let exitButton = document.getElementById('leave');
-    if (bytes.length) {
+    if (pem.length) {
         button.onclick = function() {
             let xhr = new XMLHttpRequest();
             xhr.open('POST', 'chrome:allowcert');
             xhr.onloadend = function() {
                 location.reload(true);
             };
-            xhr.send("${secret}&" + btoa(bytes));
+            xhr.send("${secret}&" + pem);
         };
     } else {
         button.style.display = "none";

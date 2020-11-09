@@ -643,8 +643,8 @@ fn scheme_fetch(
             if let Some((secret, bytes)) = data {
                 let secret = str::from_utf8(secret).ok().and_then(|s| s.parse().ok());
                 if secret == Some(*net_traits::PRIVILEGED_SECRET) {
-                    if let Ok(bytes) = base64::decode(&bytes[1..]) {
-                        context.state.extra_certs.add(bytes);
+                    if let Ok(pem) = String::from_utf8(bytes[1..].to_vec()) {
+                        context.state.cert_exceptions.add(pem);
                     }
                 }
             }

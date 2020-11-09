@@ -4,9 +4,7 @@
 
 //! A thread that takes a URL and streams back the binary data.
 
-use crate::connector::{
-    create_http_client, create_tls_config, ConnectionCerts, ExtraCerts, ALPN_H2_H1,
-};
+use crate::connector::{create_http_client, create_tls_config, CertExceptions, ReceivedCerts};
 use crate::cookie;
 use crate::cookie_storage::CookieStorage;
 use crate::fetch::cors_cache::CorsCache;
@@ -145,8 +143,8 @@ fn create_http_states(
         None => resources::read_string(Resource::SSLCertificates),
     };
 
-    let extra_certs = ExtraCerts::new();
-    let connection_certs = ConnectionCerts::new();
+    let cert_exceptions = CertExceptions::new();
+    let received_certs = ReceivedCerts::new();
 
     let http_state = HttpState {
         hsts_list: RwLock::new(hsts_list),
@@ -158,18 +156,18 @@ fn create_http_states(
         client: create_http_client(
             create_tls_config(
                 &certs,
-                ALPN_H2_H1,
-                extra_certs.clone(),
-                connection_certs.clone(),
+                vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+                cert_exceptions.clone(),
+                received_certs.clone(),
             ),
             HANDLE.lock().unwrap().as_ref().unwrap().executor(),
         ),
-        extra_certs,
-        connection_certs,
+        cert_exceptions,
+        received_certs,
     };
 
-    let extra_certs = ExtraCerts::new();
-    let connection_certs = ConnectionCerts::new();
+    let cert_exceptions = CertExceptions::new();
+    let received_certs = ReceivedCerts::new();
 
     let private_http_state = HttpState {
         hsts_list: RwLock::new(HstsList::from_servo_preload()),
@@ -181,14 +179,14 @@ fn create_http_states(
         client: create_http_client(
             create_tls_config(
                 &certs,
-                ALPN_H2_H1,
-                extra_certs.clone(),
-                connection_certs.clone(),
+                vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+                cert_exceptions.clone(),
+                received_certs.clone(),
             ),
             HANDLE.lock().unwrap().as_ref().unwrap().executor(),
         ),
-        extra_certs,
-        connection_certs,
+        cert_exceptions,
+        received_certs,
     };
 
     (Arc::new(http_state), Arc::new(private_http_state))

@@ -22,7 +22,7 @@ use hyper::body::Body;
 use hyper::{Request as HyperRequest, Response as HyperResponse};
 use mime::{self, Mime};
 use msg::constellation_msg::TEST_PIPELINE_ID;
-use net::connector::{create_tls_config, ConnectionCerts, ExtraCerts, ALPN_H2_H1};
+use net::connector::{create_tls_config, CertExceptions, ReceivedCerts};
 use net::fetch::cors_cache::CorsCache;
 use net::fetch::methods::{self, CancellationListener, FetchContext};
 use net::filemanager_thread::FileManager;
@@ -736,13 +736,7 @@ fn test_fetch_with_local_urls_only() {
     assert!(!local_response.is_network_error());
     assert!(server_response.is_network_error());
 }
-// NOTE(emilio): If this test starts failing:
-//
-// openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-//   -keyout resources/privatekey_for_testing.key       \
-//   -out resources/self_signed_certificate_for_testing.crt
-//
-// And make sure to specify `localhost` as the server name.
+
 #[test]
 fn test_fetch_with_hsts() {
     static MESSAGE: &'static [u8] = b"";
@@ -750,10 +744,10 @@ fn test_fetch_with_hsts() {
         *response.body_mut() = MESSAGE.to_vec().into();
     };
 
-    let cert_path = Path::new("../../resources/self_signed_certificate_for_testing.crt")
+    let cert_path = Path::new("../../resources/self-signed-testing-cert.crt")
         .canonicalize()
         .unwrap();
-    let key_path = Path::new("../../resources/privatekey_for_testing.key")
+    let key_path = Path::new("../../resources/self-signed-testing-cert.key")
         .canonicalize()
         .unwrap();
     let (server, url) = make_ssl_server(handler, cert_path.clone(), key_path.clone());
@@ -761,9 +755,9 @@ fn test_fetch_with_hsts() {
     let certs = fs::read_to_string(cert_path).expect("Couldn't find certificate file");
     let tls_config = create_tls_config(
         &certs,
-        ALPN_H2_H1,
-        ExtraCerts::new(),
-        ConnectionCerts::new(),
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        CertExceptions::new(),
+        ReceivedCerts::new(),
     );
 
     let mut context = FetchContext {
@@ -812,10 +806,10 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
             ));
         *response.body_mut() = b"Yay!".to_vec().into();
     };
-    let cert_path = Path::new("../../resources/self_signed_certificate_for_testing.crt")
+    let cert_path = Path::new("../../resources/self-signed-testing-cert.crt")
         .canonicalize()
         .unwrap();
-    let key_path = Path::new("../../resources/privatekey_for_testing.key")
+    let key_path = Path::new("../../resources/self-signed-testing-cert.key")
         .canonicalize()
         .unwrap();
     let (server, mut url) = make_ssl_server(handler, cert_path.clone(), key_path.clone());
@@ -824,9 +818,9 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
     let certs = fs::read_to_string(cert_path).expect("Couldn't find certificate file");
     let tls_config = create_tls_config(
         &certs,
-        ALPN_H2_H1,
-        ExtraCerts::new(),
-        ConnectionCerts::new(),
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        CertExceptions::new(),
+        ReceivedCerts::new(),
     );
 
     let mut context = FetchContext {
@@ -873,25 +867,22 @@ fn test_fetch_self_signed() {
     let handler = move |_: HyperRequest<Body>, response: &mut HyperResponse<Body>| {
         *response.body_mut() = b"Yay!".to_vec().into();
     };
-    let client_cert_path = Path::new("../../resources/certs").canonicalize().unwrap();
-    let cert_path = Path::new("../../resources/self_signed_certificate_for_testing.crt")
+
+    let cert_path = Path::new("../../resources/self-signed-testing-cert.crt")
         .canonicalize()
         .unwrap();
-    let key_path = Path::new("../../resources/privatekey_for_testing.key")
+    let key_path = Path::new("../../resources/self-signed-testing-cert.key")
         .canonicalize()
         .unwrap();
-    let (_server, mut url) = make_ssl_server(handler, cert_path.clone(), key_path.clone());
+    let (server, mut url) = make_ssl_server(handler, cert_path.clone(), key_path.clone());
     url.as_mut_url().set_scheme("https").unwrap();
 
-    let cert_data = fs::read_to_string(cert_path.clone()).expect("Couldn't find certificate file");
-    let client_cert_data =
-        fs::read_to_string(client_cert_path.clone()).expect("Couldn't find certificate file");
-    let extra_certs = ExtraCerts::new();
+    let cert_exceptions = CertExceptions::new();
     let tls_config = create_tls_config(
-        &client_cert_data,
-        ALPN_H2_H1,
-        extra_certs.clone(),
-        ConnectionCerts::new(),
+        "",
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        cert_exceptions.clone(),
+        ReceivedCerts::new(),
     );
 
     let mut context = FetchContext {
@@ -918,19 +909,10 @@ fn test_fetch_self_signed() {
 
     assert!(matches!(
         response.get_network_error(),
-        Some(NetworkError::SslValidation(..))
+        Some(NetworkError::TlsValidation(..))
     ));
 
-    extra_certs.add(cert_data.as_bytes().into());
-
-    // FIXME: something weird happens inside the SSL server after the first
-    //        connection encounters a verification error, and it no longer
-    //        accepts new connections that should work fine. We are forced
-    //        to start a new server and connect to that to verfiy that
-    //        the self-signed cert is now accepted.
-
-    let (server, mut url) = make_ssl_server(handler, cert_path.clone(), key_path.clone());
-    url.as_mut_url().set_scheme("https").unwrap();
+    cert_exceptions.add(fs::read_to_string(cert_path.clone()).unwrap());
 
     let mut request = RequestBuilder::new(url.clone(), Referrer::NoReferrer)
         .method(Method::GET)

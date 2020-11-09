@@ -752,17 +752,32 @@ pub enum NetworkError {
     /// Could be any of the internal errors, like unsupported scheme, connection errors, etc.
     Internal(String),
     LoadCancelled,
-    /// SSL validation error that has to be handled in the HTML parser
-    SslValidation(String, Vec<u8>),
+    /// TLS validation error that has to be handled in the HTML parser
+    TlsValidation(String, String),
 }
 
 impl NetworkError {
-    pub fn from_hyper_error(error: &HyperError, cert_bytes: Option<Vec<u8>>) -> Self {
+    pub fn from_hyper_error(error: &HyperError, cert_pem: Option<String>) -> Self {
         let s = error.to_string();
-        if s.contains("the handshake failed") {
-            NetworkError::SslValidation(s, cert_bytes.unwrap_or_default())
-        } else {
-            NetworkError::Internal(s)
+        match s.as_str() {
+            // https://docs.rs/hyper/0.12.35/src/hyper/error.rs.html#348
+            // https://docs.rs/rustls/0.18.1/src/rustls/error.rs.html#87
+            // https://docs.rs/webpki/0.21.3/webpki/enum.Error.html#variants
+            "error trying to connect: invalid certificate: CAUsedAsEndEntity" |
+            "error trying to connect: invalid certificate: CertExpired" |
+            "error trying to connect: invalid certificate: CertNotValidForName" |
+            "error trying to connect: invalid certificate: CertNotValidYet" |
+            "error trying to connect: invalid certificate: EndEntityUsedAsCA" |
+            "error trying to connect: invalid certificate: ExtensionValueInvalid" |
+            "error trying to connect: invalid certificate: InvalidCertValidity" |
+            "error trying to connect: invalid certificate: NameConstraintViolation" |
+            "error trying to connect: invalid certificate: PathLenConstraintViolated" |
+            "error trying to connect: invalid certificate: RequiredEKUNotFound" |
+            "error trying to connect: invalid certificate: UnknownIssuer" |
+            "error trying to connect: invalid certificate: UnsupportedCriticalExtension" => {
+                NetworkError::TlsValidation(s, cert_pem.unwrap_or_default())
+            },
+            _ => NetworkError::Internal(s),
         }
     }
 

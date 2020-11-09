@@ -11,7 +11,7 @@
 //! over events from the network and events from the DOM, using async/await to avoid
 //! the need for a dedicated thread per websocket.
 
-use crate::connector::{create_tls_config, ALPN_H1};
+use crate::connector::create_tls_config;
 use crate::cookie::Cookie;
 use crate::fetch::methods::should_be_blocked_due_to_bad_port;
 use crate::hosts::replace_host;
@@ -28,7 +28,6 @@ use ipc_channel::router::ROUTER;
 use net_traits::request::{RequestBuilder, RequestMode};
 use net_traits::{CookieSource, MessageData};
 use net_traits::{WebSocketDomAction, WebSocketNetworkEvent};
-use openssl::ssl::ConnectConfiguration;
 use servo_url::ServoUrl;
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,6 +36,7 @@ use tokio2::net::TcpStream;
 use tokio2::runtime::Runtime;
 use tokio2::select;
 use tokio2::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio_rustls::TlsConnector;
 use tungstenite::error::Error;
 use tungstenite::error::Result as WebSocketResult;
 use tungstenite::handshake::client::{Request, Response};
@@ -298,7 +298,7 @@ async fn start_websocket(
     resource_event_sender: IpcSender<WebSocketNetworkEvent>,
     protocols: Vec<String>,
     client: Request,
-    tls_config: ConnectConfiguration,
+    tls_connector: TlsConnector,
     dom_action_receiver: IpcReceiver<WebSocketDomAction>,
 ) -> Result<(), Error> {
     trace!("starting WS connection to {}", url);
@@ -327,7 +327,8 @@ async fn start_websocket(
     let try_socket = TcpStream::connect((&*domain.to_string(), port)).await;
     let socket = try_socket.map_err(Error::Io)?;
     let (stream, response) =
-        client_async_tls_with_connector_and_config(client, socket, Some(tls_config), None).await?;
+        client_async_tls_with_connector_and_config(client, socket, Some(tls_connector), None)
+            .await?;
 
     let protocol_in_use = process_ws_response(&http_state, &response, &url, &protocols)?;
 
@@ -414,14 +415,12 @@ fn connect(
 
     let tls_config = create_tls_config(
         &certs,
-        ALPN_H1,
-        http_state.extra_certs.clone(),
-        http_state.connection_certs.clone(),
+        vec![b"http/1.1".to_vec()],
+        http_state.cert_exceptions.clone(),
+        http_state.received_certs.clone(),
     );
-    let tls_config = match tls_config.build().configure() {
-        Ok(c) => c,
-        Err(e) => return Err(e.to_string()),
-    };
+
+    let tls_connector = TlsConnector::from(tls_config);
 
     let resource_event_sender2 = resource_event_sender.clone();
     match HANDLE.lock().unwrap().as_mut() {
@@ -432,7 +431,7 @@ fn connect(
                 resource_event_sender,
                 protocols,
                 client,
-                tls_config,
+                tls_connector,
                 dom_action_receiver,
             )
             .map_err(move |e| {

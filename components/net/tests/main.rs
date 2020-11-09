@@ -24,12 +24,15 @@ use crossbeam_channel::{unbounded, Sender};
 use devtools_traits::DevtoolsControlMsg;
 use embedder_traits::resources::{self, Resource};
 use embedder_traits::{EmbedderProxy, EventLoopWaker};
-use futures::{Future, Stream};
+use futures_util::{
+    compat::{Compat, Compat01As03},
+    FutureExt,
+};
 use hyper::server::conn::Http;
 use hyper::server::Server as HyperServer;
 use hyper::service::service_fn_ok;
 use hyper::{Body, Request as HyperRequest, Response as HyperResponse};
-use net::connector::{create_tls_config, ConnectionCerts, ExtraCerts, ALPN_H2_H1};
+use net::connector::{create_tls_config, CertExceptions, ReceivedCerts};
 use net::fetch::cors_cache::CorsCache;
 use net::fetch::methods::{self, CancellationListener, FetchContext};
 use net::filemanager_thread::FileManager;
@@ -39,16 +42,17 @@ use net_traits::filemanager_thread::FileTokenCheck;
 use net_traits::request::Request;
 use net_traits::response::Response;
 use net_traits::{FetchTaskTarget, ResourceFetchTiming, ResourceTimingType};
-use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use servo_arc::Arc as ServoArc;
 use servo_url::ServoUrl;
 use std::net::TcpListener as StdTcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
-use tokio::net::TcpListener;
-use tokio::reactor::Handle;
-use tokio::runtime::Runtime;
-use tokio_openssl::SslAcceptorExt;
+use tokio2::net::TcpListener;
+use tokio_compat::runtime::{Runtime, TaskExecutor};
+use tokio_rustls::rustls::internal::pemfile::{certs, pkcs8_private_keys};
+use tokio_rustls::rustls::{Certificate, NoClientAuth, PrivateKey, ServerConfig};
+use tokio_rustls::TlsAcceptor;
+use tokio_util::compat::Tokio02AsyncReadCompatExt;
 
 lazy_static! {
     pub static ref HANDLE: Mutex<Runtime> = Mutex::new(Runtime::new().unwrap());
@@ -93,9 +97,9 @@ fn new_fetch_context(
     let certs = resources::read_string(Resource::SSLCertificates);
     let tls_config = create_tls_config(
         &certs,
-        ALPN_H2_H1,
-        ExtraCerts::new(),
-        ConnectionCerts::new(),
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        CertExceptions::new(),
+        ReceivedCerts::new(),
     );
     let sender = fc.unwrap_or_else(|| create_embedder_proxy());
 
@@ -150,7 +154,7 @@ fn fetch_with_cors_cache(request: &mut Request, cache: &mut CorsCache) -> Respon
 }
 
 pub(crate) struct Server {
-    pub close_channel: futures::sync::oneshot::Sender<()>,
+    pub close_channel: futures03::channel::oneshot::Sender<()>,
 }
 
 impl Server {
@@ -163,11 +167,12 @@ fn make_server<H>(handler: H) -> (Server, ServoUrl)
 where
     H: Fn(HyperRequest<Body>, &mut HyperResponse<Body>) + Send + Sync + 'static,
 {
+    use futures01::Future;
     let handler = Arc::new(handler);
     let listener = StdTcpListener::bind("0.0.0.0:0").unwrap();
     let url_string = format!("http://localhost:{}", listener.local_addr().unwrap().port());
     let url = ServoUrl::parse(&url_string).unwrap();
-    let (tx, rx) = futures::sync::oneshot::channel::<()>();
+    let (tx, rx) = futures03::channel::oneshot::channel::<()>();
     let server = HyperServer::from_tcp(listener)
         .unwrap()
         .serve(move || {
@@ -178,7 +183,7 @@ where
                 response
             })
         })
-        .with_graceful_shutdown(rx)
+        .with_graceful_shutdown(Compat::new(rx))
         .map_err(|_| ());
 
     HANDLE.lock().unwrap().spawn(server);
@@ -186,52 +191,73 @@ where
     (server, url)
 }
 
+fn load_certs(path: &Path) -> std::io::Result<Vec<Certificate>> {
+    certs(&mut std::io::BufReader::new(std::fs::File::open(path)?))
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid cert"))
+}
+
+fn load_keys(path: &Path) -> std::io::Result<Vec<PrivateKey>> {
+    pkcs8_private_keys(&mut std::io::BufReader::new(std::fs::File::open(path)?))
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid key"))
+}
+
 fn make_ssl_server<H>(handler: H, cert_path: PathBuf, key_path: PathBuf) -> (Server, ServoUrl)
 where
     H: Fn(HyperRequest<Body>, &mut HyperResponse<Body>) + Send + Sync + 'static,
 {
-    let handler = Arc::new(handler);
     let listener = StdTcpListener::bind("[::0]:0").unwrap();
-    let listener = TcpListener::from_std(listener, &Handle::default()).unwrap();
     let url_string = format!("http://localhost:{}", listener.local_addr().unwrap().port());
     let url = ServoUrl::parse(&url_string).unwrap();
-
-    let server = listener.incoming().map_err(|_| ()).for_each(move |sock| {
-        let mut tls_server_config = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
-        tls_server_config
-            .set_certificate_file(&cert_path, SslFiletype::PEM)
-            .unwrap();
-        tls_server_config
-            .set_private_key_file(&key_path, SslFiletype::PEM)
-            .unwrap();
-
-        let handler = handler.clone();
-        tls_server_config
-            .build()
-            .accept_async(sock)
-            .map_err(|_| ())
-            .and_then(move |ssl| {
-                Http::new()
-                    .serve_connection(
-                        ssl,
-                        service_fn_ok(move |req: HyperRequest<Body>| {
-                            let mut response = HyperResponse::new(Vec::<u8>::new().into());
-                            handler(req, &mut response);
-                            response
-                        }),
-                    )
-                    .map_err(|_| ())
-            })
+    let executor = HANDLE.lock().unwrap().executor();
+    let tls_server = tls_server(executor, handler, cert_path, key_path, listener);
+    let (tx, rx) = futures03::channel::oneshot::channel::<()>();
+    HANDLE.lock().unwrap().spawn_std(async {
+        futures_util::future::select(tls_server.boxed(), rx).await;
     });
-
-    let (tx, rx) = futures::sync::oneshot::channel::<()>();
-    let server = server
-        .select(rx.map_err(|_| ()))
-        .map(|_| ())
-        .map_err(|_| ());
-
-    HANDLE.lock().unwrap().spawn(server);
-
     let server = Server { close_channel: tx };
+
     (server, url)
+}
+
+async fn tls_server<H>(
+    executor: TaskExecutor,
+    handler: H,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    listener: StdTcpListener,
+) -> std::io::Result<()>
+where
+    H: Fn(HyperRequest<Body>, &mut HyperResponse<Body>) + Send + Sync + 'static,
+{
+    let handler = Arc::new(handler);
+    let cfg = {
+        let certs = load_certs(&cert_path).unwrap();
+        let mut keys = load_keys(&key_path).unwrap();
+        let mut cfg = ServerConfig::new(NoClientAuth::new());
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        cfg.set_single_cert(certs, keys.remove(0)).unwrap();
+        Arc::new(cfg)
+    };
+    let acceptor = TlsAcceptor::from(cfg);
+    let mut listener = TcpListener::from_std(listener)?;
+
+    loop {
+        let (stream, _peer_addr) = listener.accept().await?;
+        let handler = handler.clone();
+        let acceptor = acceptor.clone();
+
+        executor.spawn_std(async move {
+            let stream_tokio02 = acceptor.accept(stream).await.unwrap();
+            let stream_tokio01 = Compat::new(stream_tokio02.compat());
+            let fut01 = Http::new().serve_connection(
+                stream_tokio01,
+                service_fn_ok(move |req: HyperRequest<Body>| {
+                    let mut response = HyperResponse::new(Vec::<u8>::new().into());
+                    handler(req, &mut response);
+                    response
+                }),
+            );
+            Compat01As03::new(fut01).await.unwrap();
+        });
+    }
 }
