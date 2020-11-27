@@ -1,0 +1,116 @@
+name: ci
+on:
+  pull_request:
+  push:
+
+env:
+  RUST_BACKTRACE: 1
+  SHELL: /bin/bash
+
+jobs:
+  desktop:
+    runs-on: ubuntu-20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          #- x86_64-unknown-linux-gnu
+          - x86_64-pc-windows-gnu
+          #- x86_64-apple-darwin
+          #- aarch64-unknown-linux-gnu
+        include:
+          #- target: x86_64-unknown-linux-gnu
+          #  packages: xorg-dev libx11-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxmu6 libxmu-dev
+          - target: x86_64-pc-windows-gnu
+            packages: linux-libc-dev libc6-dev gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 mingw-w64-x86-64-dev mingw-w64-tools gdb-mingw-w64 binutils-mingw-w64-x86-64
+          #- target: x86_64-apple-darwin
+          #  packages: gcc-10 g++-10 zlib1g-dev libmpc-dev libmpfr-dev libgmp-dev
+          #- target: aarch64-unknown-linux-gnu
+          #  packages: libc6-dev-arm64-cross libstdc++-10-dev-arm64-cross pkg-config-aarch64-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install packages
+        run: |
+          python3 -m pip install --upgrade pip virtualenv
+          sudo apt update
+          sudo apt install --no-install-recommends -y \
+            git curl autoconf autoconf2.13  libglib2.0-dev gperf build-essential cmake clang-10 libunwind-dev llvm-dev ccache \
+            libgl1-mesa-dri libgles2-mesa-dev libegl1-mesa-dev libdbus-1-dev libfreetype6-dev libharfbuzz-dev liblzma-dev \
+            ${{ matrix.packages }}
+
+      # libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
+          
+      #- name: osxcross
+      #  if: matrix.target == 'x86_64-apple-darwin'
+      #  run: |
+      #    git clone https://github.com/tpoechtrager/osxcross
+      #    cd osxcross
+      #    wget -nc https://s3.dockerproject.org/darwin/v2/MacOSX10.10.sdk.tar.xz
+      #    mv MacOSX10.10.sdk.tar.xz tarballs/
+      #    UNATTENDED=yes OSX_VERSION_MIN=10.10 ./build.sh
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          components: rustc-dev, llvm-tools-preview
+          override: true
+          profile: minimal
+          target: ${{ matrix.target }}
+
+      #- name: x86_64-unknown-linux-gnu Debug build
+      #  if: matrix.target == 'x86_64-unknown-linux-gnu'
+      #  run: |
+      #    cargo build --manifest-path ports/winit/Cargo.toml --target ${{ matrix.target }} --features "layout-2013 media-dummy"
+
+      - name: x86_64-pc-windows-gnu Debug build
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        env:
+          #RUSTFLAGS: "-Clinker=rust-lld"
+          HOST: x86_64-unknown-linux-gnu
+          TARGET: x86_64-w64-mingw32
+          CARGO_TARGET_LINKER: x86_64-w64-mingw32-gcc-posix
+          AR: x86_64-w64-mingw32-gcc-ar
+          CC: x86_64-w64-mingw32-gcc-posix
+          CPP: x86_64-w64-mingw32-gcc-posix -E
+          CFLAGS: "-m64 -std=gnu99 -static -pthread"
+          CXX: x86_64-w64-mingw32-g++-posix
+          CXXFLAGS: "-m64 -std=c++17 -static"
+          HOST_CC: clang-10
+          HOST_CFLAGS:
+          HOST_CXX: clang++-10
+          HOST_CXXFLAGS:
+          PKG_CONFIG_ALLOW_CROSS: 1
+          PKG_CONFIG: "/usr/bin/x86_64-w64-mingw32-pkg-config" # mingw-w64-tools
+          NATIVE_WIN32_PYTHON: python2 # https://github.com/servo/mozjs/blob/master/README.md#building
+          AUTOCONF: autoconf2.13 # https://github.com/servo/mozjs/blob/master/README.md#building
+        run: |
+          cargo build --manifest-path ports/winit/Cargo.toml --target x86_64-pc-windows-gnu --features "layout-2013 media-dummy"
+
+      #- name: x86_64-apple-darwin Debug build
+      #  if: matrix.target == 'x86_64-apple-darwin'
+      #  env:
+      #    CPP: "x86_64-apple-darwin14-clang++ -stdlib=libc++ -std=c++14 -E"
+      #    CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER: x86_64-apple-darwin14-clang
+      #    AR_x86_64-apple-darwin: x86_64-apple-darwin14-ar
+      #    CC_x86_64-apple-darwin: x86_64-apple-darwin14-clang
+      #    PKG_CONFIG_ALLOW_CROSS_x86_64_apple_darwin: 1
+      #  run: |
+      #    export PATH="$(pwd)/osxcross/target/bin:$PATH"
+      #    cargo build --manifest-path ports/winit/Cargo.toml --target ${{ matrix.target }} --features "layout-2013 media-dummy"
+
+      #- name: aarch64-unknown-linux-gnu Debug build
+      #  if: matrix.target == 'aarch64-unknown-linux-gnu'
+      #  env:
+      #    CPP: clang++-10 -E
+      #    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: clang-10
+      #    AR_aarch64_unknown_linux_gnu: llvm-ar-10
+      #    CC_aarch64_unknown_linux_gnu: clang-10
+      #    CXX_aarch64_unknown_linux_gnu: clang++-10
+      #    CFLAGS_aarch64_unknown_linux_gnu: "--sysroot=/usr/aarch64-linux-gnu"
+      #    CXXFLAGS_aarch64_unknown_linux_gnu: "--sysroot=/usr/aarch64-linux-gnu"
+      #    PKG_CONFIG_ALLOW_CROSS_aarch64_unknown_linux_gnu: 1
+      #    #PKG_CONFIG_aarch64_unknown_linux_gnu: "/usr/bin/aarch64-linux-gnu-pkg-config"
+      #  run: |
+      #    cargo build --manifest-path ports/winit/Cargo.toml --target ${{ matrix.target }} --features "layout-2013 media-dummy"
+
+
