@@ -1,0 +1,22 @@
+name: ci
+on:
+  pull_request:
+  push:
+
+env:
+  RUST_BACKTRACE: 1
+  SHELL: /bin/bash
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v2
+      - name: Bootstrap
+        run: |
+          python3 -m pip install --upgrade pip virtualenv
+          sudo apt update
+          python3 ./mach bootstrap
+      - name: Debug build
+        run: python3 ./mach build --dev
